@@ -1,0 +1,6 @@
+*.wat
+*.wasm
+*.c
+tmp
+mem_test.lua
+build.sh
