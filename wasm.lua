@@ -53,6 +53,17 @@ local function u_to_s(u, bits)
     end
 end
 
+---@param s integer
+---@param bits integer
+---@return integer
+local function s_to_u(s, bits)
+    if s < 0 then
+        return s + 2^bits
+    else
+        return s
+    end
+end
+
 -- https://stackoverflow.com/questions/9168058/how-to-dump-a-table-to-console
 local function tprint(tbl, indent)
     if not indent then indent = 0 end
@@ -543,7 +554,18 @@ local instparsetable = {
     [0xa6] = function(file) return {0xa6} end,-- f64.copysign
     [0x9d] = function(file) return {0x9d} end,-- f64.trunc
     [0xb6] = function(file) return {0xb6} end,-- f32.demote_f64
-    [0xfc] = function(file) return {0xfc, read_leb128(file, 32)} end, -- trunc_sat
+    [0xfc] = function(file) -- misc
+        local thing = read_leb128(file, 32);
+        if thing == 11 then
+            file:read(1);
+            return {"memory.fill"}
+        elseif thing == 10 then
+            file:read(2);
+            return {"memory.copy"}
+        else
+            error(string.format("todo: MISC %d\n", thing))
+        end
+    end,
     [0x87] = function(file) return {0x87} end, -- i64.shr_s
 }
 
@@ -678,7 +700,7 @@ end
 ---@field expr [Instruction]
 ---@field locals [ValueType]
 
----@param data Function.data
+---@param data string
 ---@return Function.parsed
 local function parse_function(data)
     -- Fuck you im using a temp file
@@ -796,11 +818,21 @@ local function write_memory(addr, v)
 end
 
 local function write_mem_i32(addr, value)
-    assert(value >= 0 and value < 0x100000000);
     write_memory(addr    ,  value        & 0xff);
     write_memory(addr + 1, (value >> 8 ) & 0xff);
     write_memory(addr + 2, (value >> 16) & 0xff);
     write_memory(addr + 3, (value >> 24) & 0xff);
+end
+
+local function write_mem_i64(addr, value)
+    write_memory(addr    ,  value        & 0xff);
+    write_memory(addr + 1, (value >> 8 ) & 0xff);
+    write_memory(addr + 2, (value >> 16) & 0xff);
+    write_memory(addr + 3, (value >> 24) & 0xff);
+    write_memory(addr + 4, (value >> 32) & 0xff);
+    write_memory(addr + 5, (value >> 40) & 0xff);
+    write_memory(addr + 6, (value >> 48) & 0xff);
+    write_memory(addr + 7, (value >> 56) & 0xff);
 end
 
 local function read_memory(addr)
@@ -808,11 +840,23 @@ local function read_memory(addr)
 end
 
 local function read_mem_i32(addr)
-    local b0 = read_memory(addr)
-    local b1 = read_memory(addr + 1)
-    local b2 = read_memory(addr + 2)
-    local b3 = read_memory(addr + 3)
-    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+    local b0 = read_memory(addr);
+    local b1 = read_memory(addr + 1);
+    local b2 = read_memory(addr + 2);
+    local b3 = read_memory(addr + 3);
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+end
+
+local function read_mem_i64(addr)
+    local b0 = read_memory(addr);
+    local b1 = read_memory(addr + 1);
+    local b2 = read_memory(addr + 2);
+    local b3 = read_memory(addr + 3);
+    local b4 = read_memory(addr + 4);
+    local b5 = read_memory(addr + 5);
+    local b6 = read_memory(addr + 6);
+    local b7 = read_memory(addr + 7);
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56);
 end
 
 -- Tests in test_i32_arithmetic.lua
@@ -849,16 +893,96 @@ end
 local function call_imported(sections, n_func_imports, func, stack, functions, globals)
     local import = sections[2][func + 1]
     assert(import.desc.type == "func");
-    if import.module == "env" and import.name == "print" then
-        assert(#stack > 0);
-        local num = table.remove(stack, #stack);
-        assert(num[1] == "i32");
-        printf("print: %d\n", num[2]);
-    else
-        error("unknown import")
-    end
+    if import.module == "env" then
+        if import.name == "print" then
+            assert(#stack > 0);
+            local num = table.remove(stack, #stack);
+            assert(num[1] == "i32");
+            printf("print: %d\n", num[2]);
+            return {}
+        end
+    elseif import.module == "wasi_snapshot_preview1" then
+        if import.name == "environ_sizes_get" then
+            assert(#stack > 1);
+            local env_buf_size = table.remove(stack, #stack);
+            assert(env_buf_size[1] == "i32");
+            local envc = table.remove(stack, #stack);
+            assert(envc[1] == "i32");
+            -- TODO: Custom env
+            write_mem_i32(envc[2], 1);
+            write_mem_i32(env_buf_size[2], #"PWD=/\0");
+            return {{"i32", 0}}
+        elseif import.name == "args_sizes_get" then
+            assert(#stack > 1);
+            local argv_buf_size = table.remove(stack, #stack);
+            assert(argv_buf_size[1] == "i32");
+            local argc = table.remove(stack, #stack);
+            assert(argc[1] == "i32");
+            -- TODO: Custom args
+            write_mem_i32(argc[2], 1);
+            write_mem_i32(argv_buf_size[2], #"vim\0");
+            return {{"i32", 0}}
+        elseif import.name == "args_get" then
+            assert(#stack > 1);
+            local argv_buf = table.remove(stack, #stack);
+            assert(argv_buf[1] == "i32");
+            local argv = table.remove(stack, #stack);
+            assert(argv[1] == "i32");
+             -- TODO: Custom args
+            write_mem_i32(argv[2], argv_buf[2])
+            write_memory(argv_buf[2], 118)
+            write_memory(argv_buf[2] + 1, 105);
+            write_memory(argv_buf[2] + 2, 109);
+            write_memory(argv_buf[2] + 3, 0);
+            return {{"i32", 0}}
+        elseif import.name == "proc_exit" then
+            printf("proc_exit with %d\n", stack[#stack][2]);
+            os.exit(stack[#stack][2])
+        elseif import.name == "fd_fdstat_get" then
+            assert(#stack > 1);
+            local stat_ptr = table.remove(stack, #stack);
+            assert(stat_ptr[1] == "i32");
+            local fd = table.remove(stack, #stack);
+            assert(fd[1] == "i32");
 
-    return {} -- TODO: Imported function returns
+            local filetype = {
+                unknown = 0,
+                block_device = 1,
+                character_device = 2,
+                directory = 3,
+                regular_file = 4,
+                socket_dgram = 5,
+                socket_stream = 6,
+                symbolic_link = 7 -- Not implemented yet in wasi i think
+            }
+
+            local rights = {
+                fd_read = 1 << 1,
+                fd_write = 1 << 6
+            }
+            
+            if fd[2] == 0 or fd[2] == 1 or fd[2] == 2 then
+                write_memory(stat_ptr[2] + 0, filetype.character_device)
+                write_memory(stat_ptr[2] + 1, 0)
+                write_memory(stat_ptr[2] + 2, 0)
+                write_memory(stat_ptr[2] + 3, 0)
+            
+                if fd == 0 then
+                    write_mem_i64(stat_ptr[2] + 8, rights.fd_read)
+                else
+                    write_mem_i64(stat_ptr[2] + 8, rights.fd_write)
+                end
+            
+                write_mem_i64(stat_ptr[2] + 16, 0)
+                return {{"i32", 0}}
+            else
+                print(fd)
+                error("todo")
+            end
+        end
+    end
+    tprint(import)
+    error("unknown import")
 end
 
 if table.copy == nil then
@@ -876,8 +1000,6 @@ if table.copy == nil then
         end
     end
 end
-
----@alias Frame any
 
 ---@param n_func_imports integer
 ---@param func integer
@@ -904,18 +1026,40 @@ local function call_func(sections, n_func_imports, func, arguments, functions, g
     end
 
     local locals = table.copy(arguments); -- Idk if i have to copy. If its by ref then i think i do
-    local stack = {};
-    local pc = 1;
+    local blocks = {{
+        type = nil,
+        pc = 1,
+        stack = {},
+        expr = code.expr,
+    }};
 
     for i = 1, #(code.locals) do
         table.insert(locals, {code.locals[i], nil})
     end
 
+    print(func)
+
     while true do
-        if pc > #(code.expr) then
-            break
+        if blocks[#blocks].pc > #(blocks[#blocks].expr) then
+            if #blocks > 1 then
+                if blocks[#blocks].thing == "loop" then
+                    blocks[#blocks].pc = 1;
+                else
+                    assert(blocks[#blocks].type == nil) -- TODO: Support block types
+                    table.remove(blocks, #blocks);
+                    -- If a function ends with a blocks end return
+                    if #blocks == 1 and blocks[#blocks].pc > #blocks[#blocks].expr then
+                        break
+                    end
+                end
+            else
+                break
+            end
         end
-        local inst = code.expr[pc];
+        
+        local cur_block = blocks[#blocks];
+        local stack = cur_block.stack;
+        local inst = cur_block.expr[cur_block.pc];
         local opcode = inst[1];
         local data = inst[2];
 
@@ -994,17 +1138,305 @@ local function call_func(sections, n_func_imports, func, arguments, functions, g
             assert(a[1] == "i32");
             table.insert(stack, {"i32", i32_add(a[2], b[2])});
         elseif opcode == 0x02 then -- block
-            tprint(data);
-            error("todo")
+            assert(data.type == nil); -- TODO: Support block types
+            table.insert(blocks, {
+                type = data.type,
+                pc = 1,
+                stack = {},
+                expr = data.expr,
+            });
+        elseif opcode == 0x0d then -- br_if
+            assert(#stack > 0);
+            local v = table.remove(stack, #stack);
+            assert(v[1] == "i32");
+            assert(data < #blocks);
+            if v[2] ~= 0 then
+                for i = 1, data do
+                    table.remove(blocks, #blocks);
+                end
+            end
+        elseif opcode == 0x45 then -- i32.eqz
+            assert(#stack > 0)
+            local v = table.remove(stack, #stack);
+            assert(v[1] == "i32");
+            if v[2] == 0 then
+                table.insert(stack, {"i32", 1})
+            else
+                table.insert(stack, {"i32", 0})
+            end
+        elseif opcode == 0x74 then -- i32.shl
+            assert(#stack > 1);
+            local amount = table.remove(stack, #stack);
+            assert(amount[1] == "i32");
+            local v = table.remove(stack, #stack);
+            assert(v[1] == "i32");
+            assert(amount[2] >= 0);
+            table.insert(stack, {"i32", u_to_s(s_to_u(v[2], 32) << s_to_u(amount[2], 32), 32)});
+        elseif opcode == 0x0c then -- br
+            assert(data < #blocks);
+            for i = 1, data do
+                table.remove(blocks, #blocks);
+            end
+        elseif opcode == 0x71 then -- i32.and
+            assert(#stack > 1);
+            local b = table.remove(stack, #stack);
+            assert(b[1] == "i32");
+            local a = table.remove(stack, #stack);
+            assert(a[1] == "i32");
+            table.insert(stack, {"i32", a[2] & b[2]}); -- TODO: Test
+        elseif opcode == 0x42 then -- i64.const
+            assert(math.type(data) ~= "float");
+            table.insert(stack, {"i64", data});
+        elseif opcode == 0x37 then -- i64.store
+            assert(#stack > 1);
+            local v = table.remove(stack, #stack);
+            assert(v[1] == "i64");
+            local addr = table.remove(stack, #stack);
+            assert(addr[1] == "i32");
+            write_mem_i64(data.offset + addr[2], v[2]);
+        elseif opcode == 0x73 then -- i32.xor
+            assert(#stack > 1);
+            local b = table.remove(stack, #stack);
+            assert(b[1] == "i32");
+            local a = table.remove(stack, #stack);
+            assert(a[1] == "i32");
+            table.insert(stack, {"i32", a[2] ~ b[2]}); -- TODO: Test
+        elseif opcode == 0x49 then -- i32.lt_u
+            local b = table.remove(stack, #stack);
+            assert(b[1] == "i32");
+            local a = table.remove(stack, #stack);
+            assert(a[1] == "i32");
+            if s_to_u(a[2], 32) < s_to_u(b[2], 32) then
+                table.insert(stack, {"i32", 1})
+            else
+                table.insert(stack, {"i32", 0})
+            end
+        elseif opcode == 0x03 then -- loop
+            assert(data.type == nil); -- TODO: Support block types
+            table.insert(blocks, {
+                type = data.type,
+                pc = 1,
+                stack = {},
+                expr = data.expr,
+                thing = "loop"
+            });
+        elseif opcode == 0x47 then -- i32.ne
+            assert(#stack > 1);
+            local b = table.remove(stack, #stack);
+            assert(b[1] == "i32");
+            local a = table.remove(stack, #stack);
+            assert(a[1] == "i32");
+            if a[2] ~= b[2] then
+                table.insert(stack, {"i32", 1})
+            else
+                table.insert(stack, {"i32", 0})
+            end
+        elseif opcode == 0x72 then -- i32.or
+            assert(#stack > 1);
+            local b = table.remove(stack, #stack);
+            assert(b[1] == "i32");
+            local a = table.remove(stack, #stack);
+            assert(a[1] == "i32");
+            table.insert(stack, {"i32", a[2] | b[2]}); -- TODO: Test
+        elseif opcode == 0x4b then -- i32.gt_u
+            assert(#stack > 1);
+            local b = table.remove(stack, #stack);
+            assert(b[1] == "i32");
+            local a = table.remove(stack, #stack);
+            assert(a[1] == "i32");
+            if s_to_u(a[2], 32) > s_to_u(b[2], 32) then
+                table.insert(stack, {"i32", 1})
+            else
+                table.insert(stack, {"i32", 0})
+            end
+        elseif opcode == 0x1b then -- select
+            assert(#stack > 2);
+            local c = table.remove(stack, #stack);
+            assert(c[1] == "i32");
+            local b = table.remove(stack, #stack);
+            assert(b[1] == "i32");
+            local a = table.remove(stack, #stack);
+            assert(a[1] == "i32");
+            if c ~= 0 then
+                table.insert(stack, a);
+            else
+                table.insert(stack, b);
+            end
+        elseif opcode == 0x76 then -- i32.shr_u
+            assert(#stack > 1);
+            local amount = table.remove(stack, #stack);
+            assert(amount[1] == "i32");
+            local v = table.remove(stack, #stack);
+            assert(v[1] == "i32");
+            assert(amount[2] >= 0);
+            table.insert(stack, {"i32", u_to_s(s_to_u(v[2], 32) >> s_to_u(amount[2], 32), 32)});
+        elseif opcode == 0x4d then -- i32.le_u
+            assert(#stack > 1);
+            local b = table.remove(stack, #stack);
+            assert(b[1] == "i32");
+            local a = table.remove(stack, #stack);
+            assert(a[1] == "i32");
+            if s_to_u(a[2], 32) <= s_to_u(b[2], 32) then
+                table.insert(stack, {"i32", 1})
+            else
+                table.insert(stack, {"i32", 0})
+            end
+        elseif opcode == 0xad then -- i64.extend_i32_u
+            assert(#stack > 0);
+            local v = table.remove(stack, #stack);
+            assert(v[1] == "i32");
+            table.insert(stack, {"i64", v[2]});
+        elseif opcode == 0x7e then -- i64.mul
+            assert(#stack > 1);
+            local b = table.remove(stack, #stack);
+            assert(b[1] == "i64");
+            local a = table.remove(stack, #stack);
+            assert(a[1] == "i64");
+            table.insert(stack, {"i64", (a[2] * b[2]) & 0xffffffffffffffff})
+        elseif opcode == 0xa7 then -- i32.wrap_i64
+            assert(#stack > 0);
+            local v = table.remove(stack, #stack);
+            assert(v[1] == "i64");
+            table.insert(stack, {"i32", u_to_s(s_to_u(v[2], 64) & 0xffffffff, 32)})
+        elseif opcode == 0x2d then -- i32.load8_u
+            assert(#stack > 0);
+            local addr = table.remove(stack, #stack);
+            assert(addr[1] == "i32");
+            table.insert(stack, {"i32", read_memory(addr[2])});
+        elseif opcode == 0xfc then
+            error("invalid")
+        elseif opcode == "memory.fill" then
+            assert(#stack > 2);
+            local amount = table.remove(stack, #stack);
+            assert(amount[1] == "i32");
+            local value = table.remove(stack, #stack);
+            assert(value[1] == "i32");
+            local ptr = table.remove(stack, #stack);
+            assert(ptr[1] == "i32");
+            for i = 1, amount[2] do
+                write_memory(ptr[2] + i - 1, value[2]);
+            end
+        elseif opcode == 0x1a then -- drop
+            assert(#stack > 0);
+            table.remove(stack, #stack);
+        elseif opcode == 0x4a then -- i32.gt_s
+            assert(#stack > 1);
+            local b = table.remove(stack, #stack);
+            assert(b[1] == "i32");
+            local a = table.remove(stack, #stack);
+            assert(a[1] == "i32");
+            if a[2] > b[2] then
+                table.insert(stack, {"i32", 1})
+            else
+                table.insert(stack, {"i32", 0})
+            end
+        elseif opcode == 0x4e then -- i32.ge_s
+            assert(#stack > 1);
+            local b = table.remove(stack, #stack);
+            assert(b[1] == "i32");
+            local a = table.remove(stack, #stack);
+            assert(a[1] == "i32");
+            if a[2] >= b[2] then
+                table.insert(stack, {"i32", 1})
+            else
+                table.insert(stack, {"i32", 0})
+            end
+        elseif opcode == 0x6d then -- i32.div_s
+            assert(#stack > 1);
+            local b = table.remove(stack, #stack);
+            assert(b[1] == "i32");
+            local a = table.remove(stack, #stack);
+            assert(a[1] == "i32");
+            assert(b[2] ~= 0);
+            -- TODO: Docs say that its undefined if the division results in 2^N - 1
+            -- Idk why thats not allowed
+            table.insert(stack, {"i32", a[2] // b[2]})
+        elseif opcode == 0x6c then -- i32.mul
+            assert(#stack > 1);
+            local b = table.remove(stack, #stack);
+            assert(b[1] == "i32");
+            local a = table.remove(stack, #stack);
+            assert(a[1] == "i32");
+            table.insert(stack, {"i32", (a[2] * b[2]) & 0xffffffff});
+        elseif opcode == 0x3a then -- i32.store8
+            assert(#stack > 1);
+            local v = table.remove(stack, #stack);
+            assert(v[1] == "i32");
+            local addr = table.remove(stack, #stack);
+            assert(addr[1] == "i32");
+            write_memory(data.offset + addr[2], v[2] & 0xff);
+        elseif opcode == 0x29 then -- i64.load
+            assert(#stack > 0);
+            local addr = table.remove(stack, #stack);
+            assert(addr[1] == "i32");
+            table.insert(stack, {"i64", read_mem_i64(addr[2])});
+        elseif opcode == 0x46 then -- i32.eq
+            assert(#stack > 1);
+            local b = table.remove(stack, #stack);
+            assert(b[1] == "i32");
+            local a = table.remove(stack, #stack);
+            assert(a[1] == "i32");
+            if a[2] == b[2] then
+                table.insert(stack, {"i32", 1})
+            else
+                table.insert(stack, {"i32", 0})
+            end
+        elseif opcode == "memory.copy" then
+            assert(#stack > 2);
+            local len = table.remove(stack, #stack);
+            assert(len[1] == "i32");
+            local src = table.remove(stack, #stack);
+            assert(src[1] == "i32");
+            local dest = table.remove(stack, #stack);
+            assert(dest[1] == "i32");
+            ---@diagnostic disable-next-line: redefined-local
+            local dest = dest[2];
+            ---@diagnostic disable-next-line: redefined-local
+            local src = src[2];
+            ---@diagnostic disable-next-line: redefined-local
+            local len = len[2];
+            if len > 0 then
+                -- If not overlapping use forward else backward copy
+                if dest < src or dest >= src + len then
+                    for i = 0, len - 1 do
+                        local byte = read_memory(src + i)
+                        write_memory(dest + i, byte)
+                    end
+                else
+                    for i = len - 1, 0, -1 do
+                        local byte = read_memory(src + i)
+                        write_memory(dest + i, byte)
+                    end
+                end
+            end
+        elseif opcode == 0x48 then -- i32.lt_s
+            assert(#stack > 1);
+            local b = table.remove(stack, #stack);
+            assert(b[1] == "i32");
+            local a = table.remove(stack, #stack);
+            assert(a[1] == "i32");
+            if a[2] < b[2] then
+                table.insert(stack, {"i32", 1})
+            else
+                table.insert(stack, {"i32", 0})
+            end
         else
-            error(string.format("todo: 0x%02X", opcode))
+            if type(opcode) == "number" then
+                error(string.format("todo: 0x%02X", opcode))
+            else
+                error(string.format("todo: %s", opcode))
+            end
         end
+
+        cur_block.pc = cur_block.pc + 1;
     end
-    assert(#stack >= #(typedata.result));
+
+    local cur_block = blocks[#blocks];
+    assert(#cur_block.stack >= #(typedata.result));
     local temp = {}
     local results = {};
     for i = 1, #(typedata.result) do
-        table.insert(temp, table.remove(stack, #stack));
+        table.insert(temp, table.remove(cur_block.stack, #cur_block.stack));
     end
     for i = 1, #(typedata.result) do
         table.insert(
@@ -1070,15 +1502,17 @@ print("Found start function:", start)
 
 local functions = {}
 local n_func_imports = 0;
-for i = 1, #(sections[2]) do
-    local import = sections[2][i]
-    if import.desc.type == "func" then
-        table.insert(functions, {
-            type = "import",
-            func = sections[1][import.desc.value + 1]
-        });
+if sections[2] ~= nil then
+    for i = 1, #(sections[2]) do
+        local import = sections[2][i]
+        if import.desc.type == "func" then
+            table.insert(functions, {
+                type = "import",
+                func = sections[1][import.desc.value + 1]
+            });
+        end
+        n_func_imports = n_func_imports + 1;
     end
-    n_func_imports = n_func_imports + 1;
 end
 for i = 1, #(sections[3]) do
     local func = sections[3][i];
@@ -1121,8 +1555,6 @@ end
 local results = call_func(sections, n_func_imports, start, {}, functions, globals)
 print("_start exited with results:")
 tprint(results)
-
-while true do end
 
 os.exit()
 
