@@ -57,12 +57,26 @@ end
 ---@param bits integer
 ---@return integer
 local function s_to_u(s, bits)
+    assert(bits == 32 or bits == 64);
     if s < 0 then
         return s + 2^bits
     else
         return s
     end
 end
+
+-- local function new_s_to_u(s, bits)
+--     local b = tostring(bits//8);
+--     return string.unpack("I" .. b, string.pack("i" .. b, s))
+-- end
+
+-- for i = -100, 100 do
+--     local a = s_to_u(i, 64);
+--     local b = new_s_to_u(i, 64);
+--     print(a, b)
+--     assert(a == b);
+-- end
+-- error()
 
 -- https://stackoverflow.com/questions/9168058/how-to-dump-a-table-to-console
 local function tprint(tbl, indent)
@@ -909,8 +923,9 @@ local function call_imported(sections, n_func_imports, func, stack, functions, g
             local envc = table.remove(stack, #stack);
             assert(envc[1] == "i32");
             -- TODO: Custom env
-            write_mem_i32(envc[2], 1);
-            write_mem_i32(env_buf_size[2], #"PWD=/\0");
+            write_mem_i32(envc[2], 0);
+            write_mem_i32(env_buf_size[2], 0);
+            print(envc[2], env_buf_size[2])
             return {{"i32", 0}}
         elseif import.name == "args_sizes_get" then
             assert(#stack > 1);
@@ -1001,14 +1016,22 @@ if table.copy == nil then
     end
 end
 
+local function_depth = 0;
+
 ---@param n_func_imports integer
 ---@param func integer
 ---@param arguments ([ValueType, any])[]
 ---@return ([ValueType, any])[]
 local function call_func(sections, n_func_imports, func, arguments, functions, globals)
+    function_depth = function_depth + 1
+    for i = 1, function_depth do
+        printf("  ");
+    end
+    print(func)
     local func_thing = assert(functions[func + 1]);
     local typedata = func_thing.func;
     if func_thing.type == "import" then
+        function_depth = function_depth - 1
         return call_imported(sections, n_func_imports, func, arguments, functions, globals)
     end
 
@@ -1037,8 +1060,6 @@ local function call_func(sections, n_func_imports, func, arguments, functions, g
         table.insert(locals, {code.locals[i], nil})
     end
 
-    print(func)
-
     while true do
         if blocks[#blocks].pc > #(blocks[#blocks].expr) then
             if #blocks > 1 then
@@ -1065,7 +1086,7 @@ local function call_func(sections, n_func_imports, func, arguments, functions, g
 
         if opcode == 0x41 then -- i32.const
             table.insert(stack, {"i32", data});
-        elseif opcode == 0x21 then -- locals.set
+        elseif opcode == 0x21 then -- local.set
             assert(#stack > 0);
             local v = table.remove(stack, #stack);
             assert(locals[data + 1][1] == v[1]);
@@ -1151,7 +1172,7 @@ local function call_func(sections, n_func_imports, func, arguments, functions, g
             assert(v[1] == "i32");
             assert(data < #blocks);
             if v[2] ~= 0 then
-                for i = 1, data do
+                for i = 0, data do
                     table.remove(blocks, #blocks);
                 end
             end
@@ -1174,7 +1195,7 @@ local function call_func(sections, n_func_imports, func, arguments, functions, g
             table.insert(stack, {"i32", u_to_s(s_to_u(v[2], 32) << s_to_u(amount[2], 32), 32)});
         elseif opcode == 0x0c then -- br
             assert(data < #blocks);
-            for i = 1, data do
+            for i = 0, data do
                 table.remove(blocks, #blocks);
             end
         elseif opcode == 0x71 then -- i32.and
@@ -1420,6 +1441,17 @@ local function call_func(sections, n_func_imports, func, arguments, functions, g
             else
                 table.insert(stack, {"i32", 0})
             end
+        elseif opcode == 0x4f then -- i32.ge_u
+            assert(#stack > 1);
+            local b = table.remove(stack, #stack);
+            assert(b[1] == "i32");
+            local a = table.remove(stack, #stack);
+            assert(a[1] == "i32");
+            if s_to_u(a[2], 32) >= s_to_u(b[2], 32) then
+                table.insert(stack, {"i32", 1})
+            else
+                table.insert(stack, {"i32", 0})
+            end
         else
             if type(opcode) == "number" then
                 error(string.format("todo: 0x%02X", opcode))
@@ -1444,6 +1476,7 @@ local function call_func(sections, n_func_imports, func, arguments, functions, g
             temp[1 + #(typedata.result) - i]
         )
     end
+    function_depth = function_depth - 1
     return results
 end
 
